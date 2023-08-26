@@ -8,7 +8,7 @@ import numpy as np
 import sklearn.base
 from sklearn.base import BaseEstimator
 import torch
-from auto_LiRPA import BoundedModule, BoundedTensor, PerturbationLpNorm
+# from auto_LiRPA import BoundedModule, BoundedTensor, PerturbationLpNorm
 
 from .utils import compute_coverage, default_loss
 
@@ -102,7 +102,7 @@ class BaseModelNc(BaseScorer):
 
     def score_batch(self, dataloader):
         ret_val = []
-        for x, _, y in tqdm(dataloader):
+        for x, y in tqdm(dataloader):
             prediction = self.model.predict(x)
             if self.normalizer is not None:
                 norm = self.normalizer.score(x) + self.beta
@@ -177,9 +177,10 @@ class FeatErrorErrFunc(RegressionErrFunc):
 
 class FeatRegressorNc(BaseModelNc):
     def __init__(self, model,
-                 # err_func=FeatErrorErrFunc(),
-                 inv_lr, inv_step, criterion=default_loss, feat_norm=np.inf, certification_method=0, cert_optimizer='sgd',
-                 normalizer=None, beta=1e-6, g_out_process=None):
+                 num_classes,
+                 inv_lr, inv_step, device,
+                 criterion=default_loss, feat_norm=np.inf, cert_optimizer='sgd',
+                 normalizer=None, beta=1e-6):
         if feat_norm in ["inf", np.inf, float('inf')]:
             self.feat_norm = np.inf
         elif (type(feat_norm) == int or float):
@@ -190,15 +191,11 @@ class FeatRegressorNc(BaseModelNc):
 
         super(FeatRegressorNc, self).__init__(model, err_func, normalizer, beta)
         self.criterion = criterion
+        self.num_classes = num_classes
         self.inv_lr = inv_lr
         self.inv_step = inv_step
-        self.certification_method = certification_method
-        self.cmethod = ['IBP', 'IBP+backward', 'backward', 'CROWN-Optimized'][self.certification_method]
-        print(f"Use {self.cmethod} method for certification")
-
         self.cert_optimizer = cert_optimizer
-        # the function to post process the output of g, because FCN needs interpolate and reshape
-        self.g_out_process = g_out_process
+        self.device = device
 
     def inv_g(self, z0, y, step=None, record_each_step=False):
         z = z0.detach().clone()
@@ -208,15 +205,12 @@ class FeatRegressorNc(BaseModelNc):
             optimizer = torch.optim.SGD([z], lr=self.inv_lr)
         elif self.cert_optimizer == "adam":
             optimizer = torch.optim.Adam([z], lr=self.inv_lr)
-
-        self.model.model.eval()
+        
+        self.model.eval()
         each_step_z = []
         for _ in range(step):
-            pred = self.model.model.g(z)
-            if self.g_out_process is not None:
-                pred = self.g_out_process(pred)
-
-            loss = self.criterion(pred.squeeze(), y)
+            pred = self.model.g(z)
+            loss = self.criterion(pred, y)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -319,9 +313,9 @@ class FeatRegressorNc(BaseModelNc):
         accumulate_val_coverage = np.zeros(max_inv_steps)
         accumulate_val_num = 0
         print("begin to find the best step number")
-        for x, _, y in tqdm(dataloader):
-            x, y = x.to(self.model.device), y.to(self.model.device)
-            z_pred = self.model.model.encoder(x)
+        for x, y in tqdm(dataloader):
+            x, y = x.to(self.device), y.to(self.device)
+            z_pred = self.model.encoder(x)
             # batch_each_step_val_coverage, val_num = self.coverage_loose(x, y, z_pred, steps=max_inv_steps, val_significance=val_significance)  # length: max_inv_steps
             batch_each_step_val_coverage, val_num = self.coverage_tight(x, y, z_pred, steps=max_inv_steps, val_significance=val_significance)  # length: max_inv_steps
             accumulate_val_coverage += np.array(batch_each_step_val_coverage) * val_num
@@ -349,10 +343,10 @@ class FeatRegressorNc(BaseModelNc):
         return best_step + 1
 
     def score(self, x, y=None):  # overwrite BaseModelNc.score()
-        self.model.model.eval()
+        self.model.eval()
         n_test = x.shape[0]
-        x, y = torch.from_numpy(x).to(self.model.device), torch.from_numpy(y).to(self.model.device)
-        z_pred = self.model.model.encoder(x)
+        x, y = torch.from_numpy(x).to(self.device), torch.from_numpy(y).to(self.device)
+        z_pred = self.model.encoder(x)
 
         if self.inv_step is None:
             self.inv_step = self.find_best_step_num(x, y, z_pred)
@@ -369,21 +363,21 @@ class FeatRegressorNc(BaseModelNc):
         return ret_val
 
     def score_batch(self, dataloader):
-        self.model.model.eval()
+        self.model.eval()
         if self.inv_step is None:
             self.inv_step = self.find_best_step_num_batch(dataloader)
 
         print('calculating score:')
         ret_val = []
-        for x, _, y in tqdm(dataloader):
-            x, y = x.to(self.model.device), y.to(self.model.device)
+        for x, y in tqdm(dataloader):
+            x, y = x.to(self.device), y.to(self.device)
 
             if self.normalizer is not None:
                 raise NotImplementedError
             else:
                 norm = np.ones(len(x))
 
-            z_pred = self.model.model.encoder(x)
+            z_pred = self.model.encoder(x)
             z_true = self.inv_g(z_pred, y, step=self.inv_step)
             batch_ret_val = self.err_func.apply(z_pred.detach().cpu(), z_true.detach().cpu())
             batch_ret_val = batch_ret_val.detach().cpu().numpy() / norm
@@ -391,65 +385,111 @@ class FeatRegressorNc(BaseModelNc):
         ret_val = np.concatenate(ret_val, axis=0)
         return ret_val
 
+
+    # def predict(self, x, nc, significance=None):
+    #     n_test = x.shape[0]
+    #     prediction = self.model.predict(x)
+
+    #     if self.normalizer is not None:
+    #         norm = self.normalizer.score(x) + self.beta
+    #     else:
+    #         norm = np.ones(n_test)
+
+    #     if significance:
+    #         intervals = np.zeros((x.shape[0], self.model.model.out_shape, 2))
+    #         feat_err_dist = self.err_func.apply_inverse(nc, significance)
+
+    #         if prediction.ndim > 1:
+    #             if isinstance(x, torch.Tensor):
+    #                 x = x.to(self.model.device)
+    #             else:
+    #                 x = torch.from_numpy(x).to(self.model.device)
+    #             z = self.model.model.encoder(x).detach()
+
+    #             lirpa_model = BoundedModule(self.model.model.g, torch.empty_like(z))
+    #             ptb = PerturbationLpNorm(norm=self.feat_norm, eps=feat_err_dist[0][0])
+    #             my_input = BoundedTensor(z, ptb)
+
+    #             if 'Optimized' in self.cmethod:
+    #                 lirpa_model.set_bound_opts(
+    #                     {'optimize_bound_args': {'ob_iteration': 20, 'ob_lr': 0.1, 'ob_verbose': 0}})
+    #             lb, ub = lirpa_model.compute_bounds(x=(my_input,), method=self.cmethod)
+    #             if self.g_out_process is not None:
+    #                 lb = self.g_out_process(lb)
+    #                 ub = self.g_out_process(ub)
+    #             lb, ub = lb.detach().cpu().numpy(), ub.detach().cpu().numpy()
+
+    #             intervals[..., 0] = lb
+    #             intervals[..., 1] = ub
+    #         else:
+    #             if not isinstance(x, torch.Tensor):
+    #                 x = torch.from_numpy(x).to(self.model.device)
+    #             z = self.model.model.encoder(x).detach()
+
+    #             lirpa_model = BoundedModule(self.model.model.g, torch.empty_like(z))
+    #             ptb = PerturbationLpNorm(norm=self.feat_norm, eps=feat_err_dist[0][0])  # feat_err_dist=[[0.122, 0.122]]
+    #             my_input = BoundedTensor(z, ptb)
+
+    #             if 'Optimized' in self.cmethod:
+    #                 lirpa_model.set_bound_opts({'optimize_bound_args': {'ob_iteration': 20, 'ob_lr': 0.1, 'ob_verbose': 0}})
+    #             lb, ub = lirpa_model.compute_bounds(x=(my_input,), method=self.cmethod)  # (bs, 1), (bs, 1)
+    #             if self.g_out_process is not None:
+    #                 lb = self.g_out_process(lb)
+    #                 ub = self.g_out_process(ub)
+    #             lb, ub = lb.detach().cpu().numpy(), ub.detach().cpu().numpy()
+
+    #             intervals[..., 0] = lb
+    #             intervals[..., 1] = ub
+
+    #         return intervals
+
+    #     else:
+    #         raise NotImplementedError
+
+
+    def sample_from_hypercube(self, center, d, num_samples=1):
+        """
+        Sample points from the hypercube defined by the infinity norm around a vector.
+        
+        Args:
+        - center (torch.Tensor): The center of the hypercube.
+        - d (float): The infinity norm of the difference between the two vectors.
+        - num_samples (int): The number of samples to generate.
+        
+        Returns:
+        - torch.Tensor: The sampled positions from the hypercube.
+        """
+        upper_bound = center + d
+        lower_bound = center - d
+        rand_vec = torch.rand((num_samples, center.shape[0])).to(self.device)
+        samples = rand_vec * (upper_bound - lower_bound) + lower_bound
+        return samples
+    
     def predict(self, x, nc, significance=None):
-        n_test = x.shape[0]
-        prediction = self.model.predict(x)
+        n = x.shape[0]
+        x = x.to(self.device)
+        z_pred = self.model.encoder(x)
+        feat_err_dist = self.err_func.apply_inverse(nc, significance)[0][0]
+        
+        prediction_set = np.zeros((n, self.num_classes))
+        
+        # for i in range(self.num_classes):
+        #     y = torch.zeros(n).type(torch.LongTensor) + i
+        #     y = y.to(self.device)
+        #     z_true = self.inv_g(z_pred, y, step=self.inv_step)
+        #     err_dist = self.err_func.apply(z_pred.detach().cpu(), z_true.detach().cpu())
+        #     err_dist = err_dist.detach().cpu().numpy()
+        #     prediction_set[:, i] = (err_dist < feat_err_dist)
+        
+        for i in range(n):
+            feat = z_pred[i]
+            samples = self.sample_from_hypercube(feat, feat_err_dist, 10_000)
+            pred = self.model.g(samples)
+            pred = torch.zeros_like(pred).scatter_(1, pred.argmax(1).unsqueeze(1), 1.)
+            pred = (pred.sum(0) >= 1.)
+            prediction_set[i] = pred.detach().cpu().numpy()
 
-        if self.normalizer is not None:
-            norm = self.normalizer.score(x) + self.beta
-        else:
-            norm = np.ones(n_test)
-
-        if significance:
-            intervals = np.zeros((x.shape[0], self.model.model.out_shape, 2))
-            feat_err_dist = self.err_func.apply_inverse(nc, significance)
-
-            if prediction.ndim > 1:
-                if isinstance(x, torch.Tensor):
-                    x = x.to(self.model.device)
-                else:
-                    x = torch.from_numpy(x).to(self.model.device)
-                z = self.model.model.encoder(x).detach()
-
-                lirpa_model = BoundedModule(self.model.model.g, torch.empty_like(z))
-                ptb = PerturbationLpNorm(norm=self.feat_norm, eps=feat_err_dist[0][0])
-                my_input = BoundedTensor(z, ptb)
-
-                if 'Optimized' in self.cmethod:
-                    lirpa_model.set_bound_opts(
-                        {'optimize_bound_args': {'ob_iteration': 20, 'ob_lr': 0.1, 'ob_verbose': 0}})
-                lb, ub = lirpa_model.compute_bounds(x=(my_input,), method=self.cmethod)
-                if self.g_out_process is not None:
-                    lb = self.g_out_process(lb)
-                    ub = self.g_out_process(ub)
-                lb, ub = lb.detach().cpu().numpy(), ub.detach().cpu().numpy()
-
-                intervals[..., 0] = lb
-                intervals[..., 1] = ub
-            else:
-                if not isinstance(x, torch.Tensor):
-                    x = torch.from_numpy(x).to(self.model.device)
-                z = self.model.model.encoder(x).detach()
-
-                lirpa_model = BoundedModule(self.model.model.g, torch.empty_like(z))
-                ptb = PerturbationLpNorm(norm=self.feat_norm, eps=feat_err_dist[0][0])  # feat_err_dist=[[0.122, 0.122]]
-                my_input = BoundedTensor(z, ptb)
-
-                if 'Optimized' in self.cmethod:
-                    lirpa_model.set_bound_opts({'optimize_bound_args': {'ob_iteration': 20, 'ob_lr': 0.1, 'ob_verbose': 0}})
-                lb, ub = lirpa_model.compute_bounds(x=(my_input,), method=self.cmethod)  # (bs, 1), (bs, 1)
-                if self.g_out_process is not None:
-                    lb = self.g_out_process(lb)
-                    ub = self.g_out_process(ub)
-                lb, ub = lb.detach().cpu().numpy(), ub.detach().cpu().numpy()
-
-                intervals[..., 0] = lb
-                intervals[..., 1] = ub
-
-            return intervals
-
-        else:
-            raise NotImplementedError
+        return prediction_set
 
 
 class BaseIcp(BaseEstimator):
@@ -521,33 +561,39 @@ class IcpRegressor(BaseIcp):
     def __init__(self, nc_function, condition=None):
         super(IcpRegressor, self).__init__(nc_function, condition)
 
+    
+    # def predict(self, x, significance=None):
+    #     self.nc_function.model.eval()
+
+    #     n_significance = (99 if significance is None
+    #                       else np.array(significance).size)
+
+    #     if n_significance > 1:
+    #         prediction = np.zeros((x.shape[0], self.nc_function.model.out_shape, 2, n_significance))
+    #     else:
+    #         prediction = np.zeros((x.shape[0], self.nc_function.model.out_shape, 2))
+
+    #     condition_map = np.array([self.condition((x[i, :], None))
+    #                               for i in range(x.shape[0])])
+
+    #     for condition in self.categories:
+    #         idx = condition_map == condition
+    #         if np.sum(idx) > 0:
+    #             p = self.nc_function.predict(x[idx, :], self.cal_scores[condition], significance)
+    #             if n_significance > 1:
+    #                 prediction[idx, :, :] = p
+    #             else:
+    #                 prediction[idx, :] = p
+
+    #     return prediction
+    
     def predict(self, x, significance=None):
-        self.nc_function.model.model.eval()
-
-        n_significance = (99 if significance is None
-                          else np.array(significance).size)
-
-        if n_significance > 1:
-            prediction = np.zeros((x.shape[0], self.nc_function.model.model.out_shape, 2, n_significance))
-        else:
-            prediction = np.zeros((x.shape[0], self.nc_function.model.model.out_shape, 2))
-
-        condition_map = np.array([self.condition((x[i, :], None))
-                                  for i in range(x.shape[0])])
-
-        for condition in self.categories:
-            idx = condition_map == condition
-            if np.sum(idx) > 0:
-                p = self.nc_function.predict(x[idx, :], self.cal_scores[condition], significance)
-                if n_significance > 1:
-                    prediction[idx, :, :] = p
-                else:
-                    prediction[idx, :] = p
-
+        self.nc_function.model.eval()
+        prediction = self.nc_function.predict(x, self.cal_scores[0], significance)
         return prediction
 
     def if_in_coverage(self, x, y, significance):
-        self.nc_function.model.model.eval()
+        self.nc_function.model.eval()
         condition_map = np.array([self.condition((x[i, :], None))
                                   for i in range(x.shape[0])])
         result_array = np.zeros(len(x)).astype(bool)
@@ -560,7 +606,7 @@ class IcpRegressor(BaseIcp):
         return result_array
 
     def if_in_coverage_batch(self, dataloader, significance):
-        self.nc_function.model.model.eval()
+        self.nc_function.model.eval()
         err_dist = self.nc_function.score_batch(dataloader)
         err_dist_threshold = self.nc_function.err_func.apply_inverse(self.cal_scores[0], significance)[0][0]
         result_array = (err_dist < err_dist_threshold)
